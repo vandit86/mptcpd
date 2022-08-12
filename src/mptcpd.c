@@ -15,17 +15,54 @@
 #include <signal.h>
 #include <assert.h>
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
 #include <ell/util.h>  // For L_STRINGIFY needed by l_error().
 #include <ell/log.h>
 #include <ell/main.h>
-#pragma GCC diagnostic pop
 
 #include <mptcpd/private/configuration.h>
 
 #include "path_manager.h"
 
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+//need for exit reading thread 
+#include <mptcpd/mptcp_ns3.h>
+
+/**
+ * @brief send "END" command to read thread end exit 
+ * 
+ */
+
+static void close_read_thread(void){
+
+        // prepare msg for exit listening thread 
+        struct sspi_ns3_message msg = {
+                        .type = SSPI_CMD_END,
+                        .value = 0
+                        }; 
+        
+        /* open in write mode, non blocking (O_NDELAY)
+           This will cause open() to return -1if there are no processes 
+           that have the file open for reading.
+        */ 
+        int fd1 = open(SSPI_FIFO_PATH, O_WRONLY,O_NDELAY);
+        // no thread are listing : exit normal 
+        if (fd1<0 ) {
+                l_info ("No child thread presented");
+                return;  
+        }  
+         
+        int num = write(fd1, &msg, sizeof(msg));
+        if (num < 0)
+                l_error("error sig int");
+        usleep(100); 
+        //close(fd1);
+}
 
 // Handle termination gracefully.
 static void signal_handler(uint32_t signo, void *user_data)
@@ -38,6 +75,7 @@ static void signal_handler(uint32_t signo, void *user_data)
         case SIGINT:
         case SIGTERM:
                 l_debug("\nTerminating %s", (char const *) user_data);
+                close_read_thread(); // close thread 
                 l_main_quit();
                 break;
         }
