@@ -44,43 +44,71 @@
 #include <stdlib.h>  // exit()
 
 #include "mptcpd/mptcp_ns3.h"
+#include <mptcpd/private/sockaddr.h>
+
+
+/*
+*******************************************************************
+*      Data Struct
+* ******************************************************************
+*/
 
 /**
  * @brief Local address to interface mapping failure value.
  */
 #define SSPI_BAD_INDEX INT_MAX
 
+/**
+ * @struct sspi_subflow_info
+ *
+ * @brief MPTCP subflow information.
+ *
+ * This plugin tracks and controlls MPTCP subflow for each network
+ * connection. A subflow is represented by its token, mptcp address ID pairs,  
+ * local/remote address of the subflow and backup flag.  
+ * Subflow is controlled by decision algorithm. Basically we need to save new 
+ * subflow into the list, control subflow usage (priority) durring connection,
+ * and remove subflow(s) from the list when connection is closed.   
+ * */
 
-/*
-        struct mptcpd_interface const *i; 
-        l_debug("interface\n"
-                "  family: %d\n"
-                "  type:   %d\n"
-                "  index:  %d\n"
-                "  flags:  0x%08x\n"
-                "  name:   %s",
-                i->family,
-                i->type,
-                i->index,
-                i->flags,
-                i->name);
+struct sspi_subflow_info {
+        mptcpd_token_t token;           // connection id 
+        mptcpd_aid_t l_id;              // local address id  
+        mptcpd_aid_t r_id;              // remote address id (received from peer)
+        struct sockaddr const *laddr;   // local IP addr
+        struct sockaddr const *raddr;   // remote IP addr 
+        bool backup;                    // is subflow backup priority flag 
+}; 
 
 
-static struct sockaddr const *const laddr1 =
-        (struct sockaddr const *) &test_laddr_1;
-static struct sockaddr_in const test_laddr_1 = {
-        .sin_family = AF_INET,
-        .sin_port   = 0x1234,
-        .sin_addr   = { .s_addr = 0x010200C0 }  // 192.0.2.1
+/*****
+ * List of @c sspi_subflow_info objects that contain MPTCP subflows of each
+ * ongoing connection.
+ */
+static struct l_queue *sspi_subflows;
+
+
+/**
+ * @struct sspi_new_subflow_info
+ * @brief Pass subflow data and pm, used in callback functions
+ * 
+ * This is a convenience structure for the purpose of making it easy
+ * to pass operation arguments through a single variable.
+ */
+struct sspi_new_subflow_info
+{
+        /// MPTCP subflow info (may be incomplete)
+        struct sspi_subflow_info *const sf;
+
+        /// Pointer to path manager.
+        struct mptcpd_pm *const pm;
 };
 
+/*
+*******************************************************************
+*      Additional functions
+* ******************************************************************
 */
-
-/********************************************************************
- *      Additional functions
- * ******************************************************************
-*/
-
 
 // debug functio print ipv4 addr in hex 
 __attribute__ ((unused)) 
@@ -94,48 +122,38 @@ static void sspi_print_sock_addr (struct sockaddr const *addr){
 }
 
 /**
- *      MPTCP limits configuartion  
-*/
-
-static uint32_t const max_addrs = 2;
-static uint32_t const max_subflows = 2;
-
-static struct mptcpd_limit const _limits[] = {
-        {
-                .type  = MPTCPD_LIMIT_RCV_ADD_ADDRS,
-                .limit = max_addrs
-        },
-        {
-                .type  = MPTCPD_LIMIT_SUBFLOWS,
-                .limit = max_subflows
-        }
-};
+ * @brief Set MPTCP Subflow Limits when plugin is loaded 
+ * @param in is path manager 
+ *  
+ */
 
 static void sspi_set_limits(void const *in)
 {
-        if (in == NULL) return ; 
+        struct mptcpd_limit const _limits[] = {
+                { .type  = MPTCPD_LIMIT_RCV_ADD_ADDRS,
+                  .limit = SSPI_MAX_ADDR },
+                { .type  = MPTCPD_LIMIT_SUBFLOWS,
+                  .limit = SSPI_MAX_SUBFLOWS }
+        };
+
+        if (in == NULL)
+                return;
+        
         struct mptcpd_pm *const pm = (struct mptcpd_pm *) in;
+        int const result =
+                mptcpd_kpm_set_limits(pm, _limits, L_ARRAY_SIZE(_limits));
 
-        int const result = mptcpd_kpm_set_limits(pm,
-                                                 _limits,
-                                                 L_ARRAY_SIZE(_limits));
-
-        if (!result)  l_info ("LIMITS CHANGED ADD_ADDR = %d , SUBFLOW = %d", 
-                                                max_addrs, max_subflows); 
+        if (!result) {
+                l_info("LIMITS CHANGED ADD_ADDR = %d , SUBFLOW = %d",
+                       SSPI_MAX_ADDR,
+                       SSPI_MAX_SUBFLOWS);
+        }
 }
-
-/* pass data with PM to callback functions */
-
-struct sspi_pass_info
-{
-        struct mptcpd_pm* pm; // pm
-        int data;             // data 
-} pi;
 
 
 /**
  *      Get address, SET FALG callback, 
- *      USED TO SET LAG ON MPTCP endpoint 
+ *      USED TO SET FLAG ON MPTCP endpoint 
  *      Can be used during mptcp session 
  *      for example :  echo -en "\02\0\0\0\01\0\0\0\c" > /tmp/mptcp-ns3-fifo
  *      will set endpoint (id = 2) with BAKUP flag 
@@ -199,14 +217,58 @@ static void sspi_get_limits_callback(struct mptcpd_limit const *limits,
         }
 }
 
+/****************************************************************/
+/**
+ * @struct sspi_nm_callback_data
+ *
+ * @brief Type used to return index associated with local address.
+ *
+ * @see @c mptcpd_nm_callback
+ */
+struct sspi_nm_callback_data
+{
+        /// Local address information.        (IN)
+        struct sockaddr const* const addr;
+
+        /// Network interface (link) index.   (OUT)
+        int index;
+};
+
+static void sspi_get_addr_callback(struct mptcpd_addr_info const *info,
+                                        void *user_data)
+{
+        struct sspi_subflow* const data = (struct sspi_subflow* const) user_data; 
+        l_info("token %u", data->token)  ; 
+        
+        data->laddr = mptcpd_addr_info_get_addr(info);
+        
+        sspi_print_sock_addr (data->laddr);
+        l_info ("family l: %d ", data->laddr->sa_family);  
+        
+        sspi_print_sock_addr (data->raddr);
+        l_info ("family r : %d", data->raddr->sa_family); 
+               
+        if (mptcpd_pm_add_subflow(data->pm,
+                                data->token,
+                                data->l_id,
+                                data->r_id,
+                                data->laddr,
+                                data->raddr,
+                                false) !=0)
+        {
+                l_error("Unable to establish subflow from id=: %d", data->l_id);
+        }
+
+        // dealocate memory  allocated with mptcpd_sockaddr_copy 
+        l_free((void*)data->raddr); 
+}
+
+/*******************************************************************/
 
 /**
  * @brief parsing incoming msg from ns-3 
  * 
  * @param msg message to be parsed 
- * @param keep this function can change this var to true if END command is 
- * received. The main mptcpd process could send this comnd to terminate 
- * listening thread end exit.
  * @param in pointer to struct mptcpd_pm *const, need cast from void
  * 
  * @return -1 if receives "end" command from mptcpd main therad.. 
@@ -260,20 +322,26 @@ static int sspi_msg_pars (struct sspi_ns3_message* msg, void const *in){
 
         // set Endpoint with (id = msg-value) with backup flag
         else if (msg->type == SSPI_CMD_BACKUP_FLAG_ON){
-                //  subflow ID to be changed 
-                mptcpd_aid_t id = (uint8_t) msg->value;  
-                // struct sspi_pass_info pi; 
-                pi.pm = (struct mptcpd_pm *)in; 
-                pi.data = (int) MPTCPD_ADDR_FLAG_BACKUP; // BACLUP flag
+                // //  subflow ID to be changed 
+                // mptcpd_aid_t id = (uint8_t) msg->value;  
+                // // struct sspi_pass_info pi; 
+                // pi.pm = (struct mptcpd_pm *)in; 
+                // pi.data = (int) MPTCPD_ADDR_FLAG_BACKUP; // BACLUP flag
                 
-                if (mptcpd_kpm_get_addr(pm, 
-                                        id,
-                                        sspi_set_flag_callback, 
-                                        (void *)&pi, 
-                                        sspi_empty_callback) != 0)
-                {
-                    l_error("Unable to get addr with id=: %d", id);
-                }
+                // if (mptcpd_kpm_get_addr(pm, 
+                //                         id,
+                //                         sspi_set_flag_callback, 
+                //                         (void *)&pi, 
+                //                         sspi_empty_callback) != 0)
+                // {
+                //     l_error("Unable to get addr with id=: %d", id);
+                // }
+
+        //        if ( mptcpd_pm_remove_subflow(pm, sf2.token, sf2.laddr, 
+        //                                 sf2.raddr) == 0)
+        //         {
+        //                 l_info("Backup OK");  
+        //         }
         }
 
         // set Endpoint with (id = msg-value) with backup flag
@@ -381,7 +449,10 @@ static void sspi_new_connection(mptcpd_token_t token,
                                 bool server_side,
                                 struct mptcpd_pm *pm)
 {
-        l_info ("NEW CONNECTION : mptcp token = %u ", token); 
+        l_info("NEW CONNECTION : token = %u, server_side = %d ",
+               token,
+               server_side);
+        
         (void) server_side; 
         (void) token;
         (void) laddr;
@@ -396,7 +467,10 @@ static void sspi_connection_established(mptcpd_token_t token,
                                         bool server_side, 
                                         struct mptcpd_pm *pm)
 {
-        l_info ("CONNECTION ESTABLISHED");
+        l_info("CONNECTION ESTABLISHED: token = %u, server_side = %d ",
+               token,
+               server_side);
+
         (void) server_side;  
         (void) token;
         (void) laddr;
@@ -429,6 +503,24 @@ static void sspi_new_address(mptcpd_token_t token,
                              struct mptcpd_pm *pm)
 {
         l_info ("NEW ADD_ADDR: token = %u , id = %u", token, id);
+        sspi_print_sock_addr (addr);
+        l_info ("new addr family r : %d", addr->sa_family);
+
+        mptcpd_aid_t m_id = 2; // HARDCODED
+        struct sockaddr *const sa = mptcpd_sockaddr_copy(addr);
+        
+        struct sspi_subflow* const data = &sf2; 
+        data->pm = pm ; 
+        data->token = token; 
+        data->l_id = m_id; 
+        data->r_id = id; 
+        data->raddr = sa;
+        data->laddr = NULL;     // we need to find out this addr to create sf 
+
+        mptcpd_kpm_get_addr(pm, m_id, sspi_get_addr_callback, data, NULL);  
+
+       
+
         (void) token;
         (void) id;
         (void) addr;
@@ -438,6 +530,7 @@ static void sspi_new_address(mptcpd_token_t token,
           The sspi plugin doesn't do anything with newly advertised
           addresses.
         */
+    
 }
 
 static void sspi_address_removed(mptcpd_token_t token,
@@ -461,13 +554,16 @@ static void sspi_new_subflow(mptcpd_token_t token,
                              bool backup,
                              struct mptcpd_pm *pm)
 {
-        l_info ("NEW SUBFLOW local <--> remote, backup %u ", backup);
-        sspi_print_sock_addr (laddr); 
-        sspi_print_sock_addr (raddr);
+        l_info ("NEW SUBFLOW local <--> remote, backup %u, token: %u ", 
+                                                backup, token);
+        //sspi_print_sock_addr (laddr); 
+        //sspi_print_sock_addr (raddr);
         
+        (void) token;
+        (void) laddr; 
+        (void) raddr; 
+        (void) backup; 
         (void) pm;  
-        (void) backup;
-        (void) token;                                                 
 }
 
 static void sspi_subflow_closed(mptcpd_token_t token,
@@ -583,6 +679,9 @@ static int sspi_init(struct mptcpd_pm *pm)
                 return -1;
         }
 
+        /*
+        /home/vad/mptcpd/build/src/mptcpd --plugin-dir=/home/vad/mptcpd/build/plugins/path_managers/.libs --path-manager=sspi --addr-flags=subflow
+        */
         l_info("MPTCP single-subflow-per-interface "
                "path manager initialized.");
 
@@ -596,6 +695,16 @@ static int sspi_init(struct mptcpd_pm *pm)
          * 
          */
 
+        
+
+        // allocate mem e copy
+        //l_memdup(sa, sizeof(struct sockaddr_in))   
+        //l_free(sa); 
+
+        //l_malloc()  Allocate memmory 
+        // struct pm_ops_info *const info = l_malloc(sizeof(*info));
+        // info->ops = ops;
+        // info->user_data = user_data;
 
         /**
          * ELL data struct (see ell/unit)
@@ -634,7 +743,7 @@ static int sspi_init(struct mptcpd_pm *pm)
         // (void) pm;
        // __attribute__ ((unused))
 
-        sspi_set_limits(NULL);
+        sspi_set_limits(pm);
         
         if (mptcpd_kpm_get_limits(pm, sspi_get_limits_callback,
                                   NULL) != 0)
@@ -663,8 +772,6 @@ static void sspi_exit(struct mptcpd_pm *pm)
 {
         l_info ("EXIT"); 
         (void) pm;
-
-        
 
         l_info("MPTCP single-subflow-per-interface path manager exited.");
 }

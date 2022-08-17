@@ -1,11 +1,16 @@
 #if !defined(MPTCPD_NS3_H)
 #define MPTCPD_NS3_H
 
+// Set MPTCP Subflow Limits when plugin is loaded 
+#define     SSPI_MAX_ADDR       2
+#define     SSPI_MAX_SUBFLOWS   2
+
 /*  FIFO NAME   */
 #define SSPI_FIFO_PATH "/tmp/mptcp-ns3-fifo"
 
-#define SSPI_IFACE_LTE 1        // LTE endpoint 
-#define SSPI_IFACE_WLAN 2       // 802.11 endpoint 
+#define     SSPI_IFACE_LTE      1       // LTE endpoint ID
+#define     SSPI_IFACE_WLAN     2       // 802.11 endpoint ID
+
 
 /*  MESSAGE MAX SIZE    */
 int  BFSZ = 256;
