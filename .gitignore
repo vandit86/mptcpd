@@ -60,3 +60,4 @@ tests/*.trs
 tests/test-suite.log
 README
 build/
+.vscode/
