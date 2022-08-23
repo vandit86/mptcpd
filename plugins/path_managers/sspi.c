@@ -42,6 +42,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdlib.h>  // exit()
+#include <sys/wait.h>
 
 #include "mptcpd/mptcp_ns3.h"
 #include "mptcpd/private/addr_info.h"
@@ -425,121 +426,111 @@ static void sspi_get_addr_callback(struct mptcpd_addr_info const *info,
  * @return -1 if receives "end" command from mptcpd main therad.. 
  *              0 othervise   
  */
-static int sspi_msg_pars (struct sspi_ns3_message* msg, void const *in){
-                
-       // l_info ("Msg type %i value %f", msg->type, (double)msg->value);
-        l_info ("Msg type %i value %d", msg->type, (int)msg->value);
+static int 
+sspi_msg_cmd_parse (struct sspi_cmd_message* msg){
 
-        if (in == NULL) return 0;
-        struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
+        l_info ("CMD: %d value: %d", msg->cmd, msg->cmd_value);
+
+        // struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
         
-        // cmd from mptcpd to stop thread (called on Cntr+C)   
-        if (msg->type == SSPI_CMD_END) return -1 ;
-
-        /* will be used as copy on write on other processes*/
-        char buf[128];
-
-        /* Receive Init MSG : IPC connection OK 
-           START tcpdump recording durring the simulation */
-        if ( msg->type == SSPI_CMD_TCPDUMP){
-              l_info("Start TCPDUMP");
-              if (fork() == 0)
-              {
-                      sprintf(buf,
-                              "tcpdump -G %d -W 1 -s 100 -w dump-0.pcap -i eth0",
-                              msg->value);
-                      l_info("%s", buf);
-                      int status = system(buf);
-                      exit(status);
-              }
-              if (fork() == 0)
-              {
-                      sprintf(buf,
-                              "tcpdump -G %d -W 1 -s 100 -w dump-1.pcap -i eth1",
-                              msg->value);
-                      l_info("%s", buf);
-                      int status = system(buf);
-                      exit(status);
-              }
-        }
-        // remove addr 
-        else if (msg->type == SSPI_CMD_DEL ){
-                const mptcpd_aid_t id = 2; 
-                if (mptcpd_kpm_remove_addr(pm, id) != 0)
-                        l_info("Unable to remove endpoint: %d", id);
-                else  
-                        l_info ("Endpoint %d Removed", id);
-        }
-
-        /**
-         * echo -en "\02\0\0\0\01\0\0\0\c" > /tmp/mptcp-ns3-fifo 
-         * will set endpoint (id = 2) with BAKUP flag
-         */
-        else if (msg->type == SSPI_CMD_BACKUP_FLAG_ON) {
-                //  subflow ID to be changed 
-                //mptcpd_aid_t id = (uint8_t) msg->value;
-
-                struct sspi_subflow_info *info = 
-                        l_queue_peek_tail(sspi_subflows);
-                
-                if (mptcpd_pm_set_backup(pm, 
-                                    info->token, 
-                                    info->laddr,
-                                    info->raddr,
-                                    true) !=0) 
-                {
-                    l_error ("Can't set backup on subflow in %u", info->token);
+        /** 
+		 * 05 cmd from mptcpd to stop thread (called on Cntr+C)
+		*/
+        if (msg->cmd == SSPI_CMD_STOP_RV_MSG) {
+				int pid;
+				//  remove zombies on exit, or each time when receive CMD ??   
+                while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+                        //printf("child %d terminated\n", pid);
                 }
-                 
+                return -1; // break reading loop
         }
 
-        // set Endpoint with (id = msg-value) with backup flag
-        else if (msg->type == SSPI_CMD_CLEAR_FLAGS) {
-                //  subflow ID to be changed 
-                // mptcpd_aid_t id = (uint8_t) msg->value;  
-                // struct sspi_pass_info pi; 
-                // pi.pm = (struct mptcpd_pm *)in; 
-                // pi.data = (int) 0;          // CLEAR all flags
+        // 01 START tcpdump recording durring the simulation */
+        else if( msg->cmd == SSPI_CMD_TCPDUMP){
+			  if (fork() == 0) {
+			  		char buf [64];
+					sprintf(buf, "%d", msg->cmd_value);
 
-                // if (mptcpd_kpm_get_addr(pm, 
-                //                         id,
-                //                         sspi_set_flag_callback, 
-                //                         (void *)&pi,
-                //                         sspi_empty_callback) != 0)
-                // {
-                //     l_error("Unable to get addr with id=: %d", id);
-                // }
+                    execl("/usr/bin/timeout", "timeout", "--signal=KILL", buf,
+							"tcpdump", "-s",  "100", "-i", "any", 
+							"-w", "dump.pcap", (char *)0); 
+              }
+            //   if (fork() == 0)
+            //   {
+            //         sprintf(buf, "timeout --signal=KILL %d tcpdump -s 100 -w dump-1.pcap -i eth1",
+            //                 msg->cmd_value);
+            //         l_info("%s", buf);
+            //         int status = system(buf);
+            //         exit(status);
+            //   }
         }
 
-        else if (msg->type == SSPI_CMD_WIFI_SNR) {
-                l_info ("SNR : %d", msg->value); 
-                // if ( mptcpd_kpm_dump_addrs(pm, 
-                //         sspi_set_flag_callback, (void*)in) !=0){
-                //                 l_error ("Unable dump adrese"); 
-                //         }
-        }
+        // /**
+        //  * echo -en "\02\0\0\0\01\0\0\0\c" > /tmp/mptcp-ns3-fifo
+        //  * will set endpoint (id = 2) with BAKUP flag
+        //  */
+        // else if (msg->type == SSPI_CMD_BACKUP_FLAG_ON) {
+        //         //  subflow ID to be changed
+        //         //mptcpd_aid_t id = (uint8_t) msg->value;
+
+        //         struct sspi_subflow_info *info =
+        //                 l_queue_peek_tail(sspi_subflows);
+
+        //         if (mptcpd_pm_set_backup(pm,
+        //                             info->token,
+        //                             info->laddr,
+        //                             info->raddr,
+        //                             true) !=0)
+        //         {
+        //             l_error ("Can't set backup on subflow in %u",
+        //             info->token);
+        //         }
+
+        // }
+
+        // // set Endpoint with (id = msg-value) with backup flag
+        // else if (msg->type == SSPI_CMD_CLEAR_FLAGS) {
+        //         //  subflow ID to be changed
+        //         // mptcpd_aid_t id = (uint8_t) msg->value;
+        //         // struct sspi_pass_info pi;
+        //         // pi.pm = (struct mptcpd_pm *)in;
+        //         // pi.data = (int) 0;          // CLEAR all flags
+
+        //         // if (mptcpd_kpm_get_addr(pm,
+        //         //                         id,
+        //         //                         sspi_set_flag_callback,
+        //         //                         (void *)&pi,
+        //         //                         sspi_empty_callback) != 0)
+        //         // {
+        //         //     l_error("Unable to get addr with id=: %d", id);
+        //         // }
+        // }
 
         // stert generate traffic in separate process
-        else if (msg->type == SSPI_CMD_IPERF_START) {
-                if (fork() == 0){
-                        sprintf(buf,
-                                // "/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh iperf -c 13.0.0.2 -e -i1 -n %d",
-                                "/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh iperf -c 13.0.0.2 -e -i1 -t %d",
-                                msg->value);
-                        l_info("%s",buf); 
-                        int status = system(buf);
-                        // maybe should try with execl () instead of system()
-                        // execl("/path/to/foo", "foo", "arg1", "arg2", "arg3", 0);
-                        exit(status);  
+        else if (msg->cmd == SSPI_CMD_IPERF_START) {
+            if (fork() == 0) {
+                char buf[64];
+                // maybe should try with execl () instead of system
+				sprintf(buf,"iperf -c 13.0.0.2 -e -i1 -t %d", msg->cmd_value); 
+                l_info("%s", buf);
+				execl ("/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh", 
+						"use_mptcp.sh", 
+						buf, (char *)0);
                 }
 
         } else {
                 // just inform user, continue to reading 
-                l_info("Uknown ns3 message : %d", (int)msg->type);
+                l_info("Uknown CMD msg : %d", msg->cmd);
         }
 
         return EXIT_SUCCESS; 
 }
+
+static int 
+spi_msg_data_parse (struct sspi_data_message* msg){
+        l_info("rssi %u", msg->rssi);
+        return EXIT_SUCCESS; 
+} 
 
 /**
  * @brief starts listeng thread. Listeng for upcoming commands from NS-3
@@ -554,7 +545,7 @@ static void* sspi_connect_pipe(void *in)
         // struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
 
         int fd;
-        struct sspi_ns3_message msg;
+        struct sspi_message msg;
 
         /* Creating the named file(FIFO) */
         unlink(SSPI_FIFO_PATH);
@@ -562,22 +553,34 @@ static void* sspi_connect_pipe(void *in)
 
         /* non blocking syscall open() */
         fd = open(SSPI_FIFO_PATH, O_RDWR);
-
+        
         if (fd < 0)
                 exit(1); // check fd
-
         /* maybe it's better to use poll() for non bloking */
         ssize_t nb = 0; // num of bytes readed
-        l_info("listening thead..");
-        while ((nb = read(fd, &msg, sizeof(msg))) > 0)
+        l_info("listening thead.. OK");
+        while ((nb = read(fd, &msg, sizeof(struct sspi_message))) > 0)
         {
                 /* now parsing msg data                 */
                 /* read until receive stop command      */
                 l_info("Received: %lu bytes \n", nb);
-                
+                l_info("msg type : %d", msg.type);
+
+                if (msg.type == SSPI_MSG_TYPE_CMD) {
+                        if (sspi_msg_cmd_parse(
+                                (struct sspi_cmd_message*) (&msg.data)) < 0)
+                                break;
+                } else if (msg.type == SSPI_MSG_TYPE_DATA) {
+                        if (spi_msg_data_parse(
+                                (struct sspi_data_message*) (&msg.data)) < 0)
+                                break;
+                }
+
+                // clean ?? 
+                // memset(&msg, 0, sizeof(msg));
                 // receive "end" command
-                if (sspi_msg_pars(&msg, in) < 0)
-                        break;
+                // if (sspi_msg_pars(&msg, in) < 0)
+                //         break;
         }
         // close fd when nothing to read end exit the thread 
         //close(fd);
@@ -756,7 +759,7 @@ static void sspi_new_interface (struct mptcpd_interface const *i,
 static void sspi_update_interface (struct mptcpd_interface const *i,
                          struct mptcpd_pm *pm)
 {
-        l_info ("UPDATE interface flags");
+        l_info ("UPDATE interface");
         (void) i; 
         (void) pm;  
 }
@@ -868,7 +871,7 @@ static void sspi_exit(struct mptcpd_pm *pm)
 
 MPTCPD_PLUGIN_DEFINE(sspi,
                      "Single-subflow-per-interface path manager",
-                     MPTCPD_PLUGIN_PRIORITY_DEFAULT,
+                     MPTCPD_PLUGIN_PRIORITY_HIGH,
                      sspi_init,
                      sspi_exit)
 

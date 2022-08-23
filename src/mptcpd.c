@@ -40,26 +40,40 @@
 
 static void close_read_thread(void){
 
-        // prepare msg for exit listening thread 
-        struct sspi_ns3_message msg = {
-                        .type = SSPI_CMD_END,
-                        .value = 0
-                        }; 
-        
+         
+        //prepare msg for exit listening thread  
+        struct sspi_cmd_message cmd = {
+                .cmd = SSPI_CMD_STOP_RV_MSG 
+        }; 
+
+        struct sspi_message msg = {
+                        .type = SSPI_MSG_TYPE_CMD
+                        };
+        memcpy(msg.data, &cmd, sizeof(cmd)); 
+
         /* open in write mode, non blocking (O_NDELAY)
            This will cause open() to return -1if there are no processes 
            that have the file open for reading.
         */ 
-        int fd1 = open(SSPI_FIFO_PATH, O_WRONLY,O_NDELAY);
-        // no thread are listing : exit normal 
-        if (fd1<0 ) {
-                l_info ("No child thread presented");
-                return;  
-        }  
-         
-        int num = write(fd1, &msg, sizeof(msg));
-        if (num < 0)
-                l_error("error sig int");
+        
+        // FILE *fp; 
+        // int fifo_fd = open(SSPI_FIFO_PATH, O_WRONLY | O_NONBLOCK);
+
+        // // no fifo presented : exit normally 
+        // if ((fp = fdopen(fifo_fd, "w")) == NULL){
+        //         l_info("No FIFO presented");
+        //         return;
+        // }
+        // // send msg to stop therad; 
+        // if (fwrite(&msg, sizeof(msg), 1, fp) == 0)
+        //         l_error("error sig int");
+        
+
+
+        int fp = open(SSPI_FIFO_PATH, O_WRONLY,O_NDELAY);
+        if (fp < 0) return; 
+        if ( write(fp, &msg, sizeof(msg)) < 0 ) return;  
+        
         usleep(100); 
         //close(fd1);
 }
