@@ -31,7 +31,7 @@
 //#include <conio.h>
 
 #include <mptcpd/addr_info.h>
-
+//#include <sockaddr.h>
 #include <mptcpd/plugin.h>
 
 // requered for pipe fifo
@@ -47,7 +47,6 @@
 #include "mptcpd/mptcp_ns3.h"
 #include "mptcpd/private/addr_info.h"
 #include <mptcpd/private/sockaddr.h>
-
 
 /*
 *******************************************************************
@@ -79,7 +78,10 @@ struct sspi_subflow_info {
         mptcpd_aid_t r_id;              // remote address id (received from peer)
         struct sockaddr const *laddr;   // local IP addr
         struct sockaddr const *raddr;   // remote IP addr 
-        bool backup;                    // is subflow backup priority flag 
+        bool backup;                    // is subflow backup priority flag
+        bool active;                    // is sf avilable for interaction 
+        //time_t last_backup            // time(0) last time backup flag changed
+        //time_t last_active time(0)    // last time active flag changed 
 }; 
 
 
@@ -101,6 +103,60 @@ static double sspi_rss_value = -100; // dBm
 *      Additional functions
 * ******************************************************************
 */
+
+/**
+ * @brief Match a @c sockaddr object.
+ *
+ * A network address represented by @a a (@c struct @c sockaddr)
+ * matches if its @c family and @c addr members match those in the
+ * @a b.
+ *
+ * @param[in] a Currently monitored network address of type @c struct
+ *              @c sockaddr*.
+ * @param[in] b Network address of type @c struct @c sockaddr*
+ *              to be compared against network address @a a.
+ *
+ * @return @c true if the network address represented by @a a matches
+ *         the address @a b, and @c false otherwise.
+ *
+ * @see l_queue_find()
+ * @see l_queue_remove_if()
+ */
+static bool sspi_sockaddr_match(void const *a, void const *b)
+{
+        struct sockaddr const *const lhs = a;
+        struct sockaddr const *const rhs = b;
+
+        assert(lhs);
+        assert(rhs);
+        assert(lhs->sa_family == AF_INET || lhs->sa_family == AF_INET6);
+
+        bool matched = (lhs->sa_family == rhs->sa_family);
+
+        if (!matched)
+                return matched;
+
+        if (lhs->sa_family == AF_INET) {
+                struct sockaddr_in const *const l =
+                        (struct sockaddr_in const *) lhs;
+                struct sockaddr_in const *const r =
+                        (struct sockaddr_in const *) rhs;
+
+                matched = (l->sin_addr.s_addr == r->sin_addr.s_addr);
+        } else {
+                struct sockaddr_in6 const *const l =
+                        (struct sockaddr_in6 const *) lhs;
+                struct sockaddr_in6 const *const r =
+                        (struct sockaddr_in6 const *) rhs;
+
+                matched = (memcmp(&l->sin6_addr,
+                                  &r->sin6_addr,
+                                  sizeof(l->sin6_addr))
+                                   == 0);
+        }
+
+        return matched;
+}
 
 // debug functio print ipv4 addr in hex
 __attribute__((unused)) static void
@@ -197,38 +253,10 @@ static void sspi_foreach_show(void *data, void *user_data)
     (void) user_data; 
     struct sspi_subflow_info const *const sf = data;
 
-    l_info ("Subflow: %u backup %u", sf->token, sf->backup) ;
-    sspi_sock_addr_print(sf->laddr);
-    sspi_sock_addr_print(sf->raddr);
-}
-
-/**
- * Create @c sspi_subflow_info struct and save new subflow into subflows list
- * @param id mptcp endpoint id could be SSPI_IFACE_WLAN or SSPI_IFACE_LTE 
- * (see mptcp_ns3.h). ID is nedded to identify network assuming initial 
- * connection maded through LTE subflow assuming additional connection on WLAN 
- * network all new sf's came without backup flag, i.e. backup = false 
- */
-static void sspi_subflow_add( mptcpd_token_t token,
-                                struct sockaddr const *laddr,
-                                struct sockaddr const *raddr, 
-                                mptcpd_aid_t id)
-{
-        // struct sspi_subflow_info *const info = l_malloc(sizeof(*info));
-        struct sspi_subflow_info *const info =
-                l_malloc(sizeof(struct sspi_subflow_info));
-
-        info->l_id = info->r_id = id;
-        info->token             = token;
-        info->backup            = false;
-        info->laddr             = mptcpd_sockaddr_copy(laddr);
-        info->raddr             = mptcpd_sockaddr_copy(raddr);
-
-        // push new subflow into the list
-        l_queue_push_tail(sspi_subflows, (void *) info);
-
-        l_info ("Print SF list : "); 
-        l_queue_foreach (sspi_subflows, sspi_foreach_show, NULL); 
+    l_info ("ID: %u, token: %u, backup: %u, active: %u", 
+                                sf->l_id, sf->token, sf->backup, sf->active);
+    //sspi_sock_addr_print(sf->laddr);
+    //sspi_sock_addr_print(sf->raddr);
 }
 
 /**
@@ -266,6 +294,79 @@ static bool sspi_subflow_id_match(void const *a, void const *b)
         struct sspi_subflow_info const *const info = a;
         mptcpd_aid_t const *const b_id = b;
         return info->l_id == *b_id;
+}
+
+/**
+ * @brief Match all values of a MPTCP subflow @c (struct sspi_subflow_info). 
+ * @return @c true if the MPTCP subflow a matches the user 
+ * supplied info, and @c false otherwise.
+ */
+static bool sspi_subflow_match(void const *a, void const *b)
+{
+        assert(a);
+        assert(b);
+
+        struct sspi_subflow_info const *const sf_a = a;
+        struct sspi_subflow_info const *const sf_b = b;
+        return (sf_a->token == sf_b->token)
+            && (sf_a->l_id == sf_b->l_id)
+            && (sf_a->r_id == sf_b->r_id) 
+            && (sspi_sockaddr_match (sf_a->laddr, sf_b->laddr))
+            && (sspi_sockaddr_match (sf_a->raddr, sf_b->raddr));
+}
+
+/**
+ * @brief  Create @c sspi_subflow_info struct and save new subflow into subflows list
+ * 
+ * @param token connection tocken id 
+ * @param laddr local addr 
+ * @param raddr remote addr 
+ * @param id mptcp endpoint. l_id = r_id. could be SSPI_IFACE_WLAN or SSPI_IFACE_LTE 
+ * ID is nedded to identify network: assuming initial connection maded through 
+ * LTE subflow assuming additional connection on WLAN
+ * @param backup flag of sf 
+ * @param active is subflow activation was confirmed with ACK thoroug new_subflow
+ * callback func 
+ *   
+ */
+static void sspi_subflow_add( mptcpd_token_t token,
+                                struct sockaddr const *laddr,
+                                struct sockaddr const *raddr, 
+                                mptcpd_aid_t id,
+                                bool backup, 
+                                bool active)
+{
+        struct sspi_subflow_info *const info =
+                l_malloc(sizeof(struct sspi_subflow_info));
+
+        info->l_id = info->r_id = id;
+        info->token             = token;
+        info->backup            = backup;
+        info->laddr             = mptcpd_sockaddr_copy(laddr);
+        info->raddr             = mptcpd_sockaddr_copy(raddr);
+        info->active            = active; 
+        
+        // check IF same sobflow already exist
+        struct sspi_subflow_info *sf_info =
+                l_queue_find(sspi_subflows, sspi_subflow_match, info);
+
+        // sf not found: push new subflow into the list if not exists
+        if (sf_info == NULL){
+                l_queue_push_tail(sspi_subflows, (void *) info);
+        }
+        // sf found, just change 'active' status of the existing sf
+        else { 
+                sf_info->active = active;
+                l_free(info);
+                // todo : check timestamp 
+                // time_t t1 = time(0);
+                // double datetime_diff_ms = difftime(t1, t0) * 1000.;
+        }
+
+        // debug 
+        puts ("Print SF list : "); 
+        l_queue_foreach (sspi_subflows, sspi_foreach_show, NULL); 
+        puts(""); 
 }
 
 
@@ -334,6 +435,7 @@ static bool sspi_interface_id_match(void const *a, void const *b)
 
 
 /*************************************************************************************/
+/*************************************************************************************/
 
 /**
  * @brief parsing incoming msg from ns-3 
@@ -374,14 +476,28 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
 							"tcpdump", "-s",  "100", "-i", "any", 
 							"-w", "/home/vad/dump.pcap", (char *)0); 
               }
-            //   if (fork() == 0)
-            //   {
-            //         sprintf(buf, "timeout --signal=KILL %d tcpdump -s 100 -w dump-1.pcap -i eth1",
-            //                 msg->cmd_value);
-            //         l_info("%s", buf);
-            //         int status = system(buf);
-            //         exit(status);
-            //   }
+        
+        }
+        // 02 create sf on id=cmd_value endpoint
+        // echo -en "\01\02\00\00\00\00\c" > /tmp/mptcp-ns3-fifo 
+        else if (msg->cmd == SSPI_CMD_CREATE_SF){
+
+            // get last entry from sf list (should be non active) 
+            struct sspi_subflow_info *info = 
+                    l_queue_peek_tail (sspi_subflows);
+            assert(info);
+            if (!info->active) {
+                    if (mptcpd_pm_add_subflow(pm,
+                                              info->token,
+                                              info->l_id,
+                                              info->r_id,
+                                              info->laddr,
+                                              info->raddr,
+                                              false)
+                        != 0)
+                            l_error("can't create new subflow %u",
+                                    info->token);
+            }
         }
 
         /**
@@ -410,7 +526,6 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
                 }
 
                 info->backup = true; 
-
         }
 
           /**
@@ -449,7 +564,7 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
             if (fork() == 0) {
                 char buf[64];
                 // maybe should try with execl () instead of system
-				sprintf(buf,"iperf -c 13.0.0.2 -e -i1 -t %d", msg->cmd_value); 
+				sprintf(buf,"iperf -c 13.0.0.2 -e -i1 -t %d ", msg->cmd_value); 
                 l_info("%s", buf);
 				execl ("/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh", 
 						"use_mptcp.sh", 
@@ -465,6 +580,7 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
 }
 
 /*****************************************************************************************/ 
+/*****************************************************************************************/ 
 
 /**
  * @brief receive and parse data from NS-3.
@@ -474,94 +590,70 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
  * @return 0 on sucess , -1 on failure 
  */
 static int 
-spi_msg_data_parse (struct sspi_data_message* msg, void* in ){
+sspi_msg_data_parse (struct sspi_data_message* msg, void* in ){
         
         struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
         //l_info("Received RSSI: %f, NOISE: %f ", msg->rss, msg->noise); 
 
+        // No active connections, nothing to manage
+        if (l_queue_isempty(sspi_subflows)){
+            return EXIT_SUCCESS;
+        }
+
+
+        mptcpd_aid_t l_id = (uint8_t) SSPI_IFACE_WLAN; 
+        // find first sf with id = wlan
+        struct sspi_subflow_info *info =
+                l_queue_find(sspi_subflows, sspi_subflow_id_match, &l_id);
+        
+        // decision about backup flag 
         // SIMPLE LPF  α * x[i] + (1-α) * y[i-1]
         double alpha = 0.85; // alpha value
         sspi_rss_value = alpha * msg->rss + (1 - alpha) * sspi_rss_value;
+        bool backup_wlan = (sspi_rss_value <= SSPI_RSS_THRESHOLD)? true:false;
 
-        mptcpd_aid_t l_id = (uint8_t) SSPI_IFACE_WLAN; 
-        bool backup_wlan = (sspi_rss_value <= SSPI_RSS_THRESHOLD)? true:false; 
+        // no info avilable for sf wlan connections,receive ADD_ADDR from pear?
+        if (info == NULL) {
+            l_info ("no info avilable for sf wlan connections (not receive ADD_ADDR from pear ?)");
+        }
+        // wlan sf not active : create new sf
+        else if (!info->active){
+            puts ("wlan sf not active : create new sf");
 
-        if (!l_queue_isempty(sspi_subflows)){
-            struct sspi_subflow_info *info = l_queue_find( sspi_subflows, 
-                                            sspi_subflow_id_match, &l_id);
-            //assert(info);   
-            if (info == NULL || info->backup == backup_wlan) {
-               // l_info ("zero"); 
-                return  EXIT_SUCCESS; 
-            }
+            // will invoce new_subflow callback on sucess sf creation
+            if (mptcpd_pm_add_subflow(pm,
+                                      info->token,
+                                      info->l_id,
+                                      info->r_id,
+                                      info->laddr,
+                                      info->raddr,
+                                      backup_wlan)
+                != 0)
+                    l_error("Can't create new subflow %u", info->token);
 
-            if (mptcpd_pm_set_backup(   pm,
-                                        info->token,
-                                        info->laddr,
-                                        info->raddr,
-                                        backup_wlan
-                                    ) != 0 ) 
-            {
-                l_error("Can't change backup status to %u", backup_wlan);
-            }
-            info->backup = backup_wlan;
+                // use callback, with timer to minitor request/responce..
+                info->active = true ;  
         }
 
-        return EXIT_SUCCESS; 
+        // change backup flag if not match required value
+        // shoul invoce sf_priority ? 
+        else if (info->backup != backup_wlan) {
+                if (mptcpd_pm_set_backup(pm,
+                                         info->token,
+                                         info->laddr,
+                                         info->raddr,
+                                         backup_wlan)
+                    != 0) {
+                        l_error("Can't change backup status to %u",
+                                backup_wlan);
+                }
+                // use callback instead .. 
+                info->backup = backup_wlan;
+        }
+
+        return EXIT_SUCCESS;
 } 
 
-/*****************************************************************************************/ 
-
-/**
- * @brief starts listeng thread. Listeng for upcoming commands from NS-3
- *  
- * @param in mptcpd_pm path manager  
- */
-
-static void* sspi_connect_pipe(void *in)
-{
-        if (in == NULL) EXIT_FAILURE; // path manager is required 
-        //struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
-
-        int fd;
-        struct sspi_message msg;
-
-        /* Creating the named file(FIFO) */
-        unlink(SSPI_FIFO_PATH);
-        mkfifo(SSPI_FIFO_PATH, 0666);
-
-        /* non blocking syscall open() */
-        fd = open(SSPI_FIFO_PATH, O_RDWR);
-        
-        if (fd < 0)
-                exit(1); // check fd
-        /* maybe it's better to use poll() for non bloking */
-        ssize_t nb = 0; // num of bytes readed
-        l_info("listening thead.. OK");
-        while ((nb = read(fd, &msg, sizeof(struct sspi_message))) > 0)
-        {
-                /* now parsing msg data                 */
-                /* read until receive stop command      */
-                // l_info("Received: %lu bytes \n", nb);
-                // l_info("msg type : %d", msg.type);
-
-                if (msg.type == SSPI_MSG_TYPE_CMD) {
-                        if (sspi_msg_cmd_parse(
-                                (struct sspi_cmd_message*) (&msg.data), in) < 0)
-                                break;
-                } else if (msg.type == SSPI_MSG_TYPE_DATA) {
-                        if (spi_msg_data_parse(
-                                (struct sspi_data_message*) (&msg.data), in) < 0)
-                                break;
-                }
-                // clean ?? 
-                // memset(&msg, 0, sizeof(msg));
-        }
-        // close fd when nothing to read end exit the thread 
-        //close(fd);
-        l_info("Exit Reading thread");
-        return EXIT_SUCCESS ; 
-}
 
 /*****************************************************************************************/
 //                     Mptcpd Plugin Operations
@@ -598,8 +690,8 @@ static void sspi_connection_established(mptcpd_token_t token,
 {
         l_info("CONNECTION ESTABLISHED: token = %u", token);
         
-        // create initial sf_info 
-        sspi_subflow_add (token,laddr,raddr,SSPI_IFACE_LTE); 
+        // create initial 'active' , 'no backup' subflow  
+        sspi_subflow_add (token,laddr,raddr,SSPI_IFACE_LTE, false, true); 
 
         (void) server_side;  
         (void) pm;
@@ -622,7 +714,8 @@ static void sspi_connection_closed(mptcpd_token_t token,
 
 /**
  * We receive ADD_ADDR from pear : 
- * Try to establish new subflow on WLAN iface using the data provided by peer.
+ * do not establish new subflow on WLAN, just save the data on subflows list.
+ * new sf will be created after decision algorithm parce incoming data 
  */
 static void sspi_new_address(mptcpd_token_t token,
                              mptcpd_aid_t id,
@@ -641,15 +734,14 @@ static void sspi_new_address(mptcpd_token_t token,
         // find local addr of wlan interface 
         struct sockaddr const *l_addr = mptcpd_addr_info_get_addr(info); 
         assert(l_addr); 
+        // struct sockaddr *const raddr = mptcpd_sockaddr_copy(addr); 
+
+        // Do not establish new subflow connection just create record about 
+        // potential subflow, mark sf as 'non active', so we can use it 
+        // to create new subflows when decision algorithm order it..    
+        sspi_subflow_add (token, l_addr, addr, SSPI_IFACE_WLAN,false, false);
+        (void) pm; 
         
-        // struct sockaddr *const raddr = mptcpd_sockaddr_copy(addr);
-
-        // establish new subflow connection with wlan network 
-        if (mptcpd_pm_add_subflow(pm, token, SSPI_IFACE_WLAN,
-                                  id, l_addr, addr, false) != 0) {
-                l_error("Unable to establish new subflow for token  %u", token);
-        }
-
         /**
          * @TODO should be, try to create sf for each avilable address that are 
          * not already in connection. 
@@ -685,11 +777,10 @@ static void sspi_new_subflow(mptcpd_token_t token,
                              struct mptcpd_pm *pm)
 {
         l_info("NEW SUBFLOW: token: %u " , token);
-        // create sf info and add to list 
-        sspi_subflow_add (token, laddr, raddr, SSPI_IFACE_WLAN); 
+        
+        // create confirmed 'active' sf and add to list 
+        sspi_subflow_add (token, laddr, raddr, SSPI_IFACE_WLAN, backup, true); 
         (void) pm;
-        (void) backup; 
-          
 }
 
 static void sspi_subflow_closed(mptcpd_token_t token,
@@ -713,7 +804,7 @@ static void sspi_subflow_priority(mptcpd_token_t token,
                                   bool backup,
                                   struct mptcpd_pm *pm)
 {
-        l_info ("SUBFLOW PRIORITY");
+        puts ("SUBFLOW PRIORITY");
         (void) token;
         (void) laddr;
         (void) raddr;
@@ -792,6 +883,59 @@ static struct mptcpd_plugin_ops const pm_ops = {
 };
 
 /*****************************************************************************************/
+
+/*****************************************************************************************/ 
+
+/**
+ * @brief starts listeng thread. Listeng for upcoming commands from NS-3
+ *  
+ * @param in mptcpd_pm path manager  
+ */
+
+static void* sspi_connect_pipe(void *in)
+{
+        if (in == NULL) EXIT_FAILURE; // path manager is required 
+        //struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
+
+        int fd;
+        struct sspi_message msg;
+
+        /* Creating the named file(FIFO) */
+        unlink(SSPI_FIFO_PATH);
+        mkfifo(SSPI_FIFO_PATH, 0666);
+
+        /* non blocking syscall open() */
+        fd = open(SSPI_FIFO_PATH, O_RDWR);
+        
+        if (fd < 0)
+                exit(1); // check fd
+        /* maybe it's better to use poll() for non bloking */
+        ssize_t nb = 0; // num of bytes readed
+        l_info("listening thead.. OK");
+        while ((nb = read(fd, &msg, sizeof(struct sspi_message))) > 0)
+        {
+                /* now parsing msg data                 */
+                /* read until receive stop command      */
+                // l_info("Received: %lu bytes \n", nb);
+                // l_info("msg type : %d", msg.type);
+
+                if (msg.type == SSPI_MSG_TYPE_CMD) {
+                        if (sspi_msg_cmd_parse(
+                                (struct sspi_cmd_message*) (&msg.data), in) < 0)
+                                break;
+                } else if (msg.type == SSPI_MSG_TYPE_DATA) {
+                        if (sspi_msg_data_parse(
+                                (struct sspi_data_message*) (&msg.data), in) < 0)
+                                break;
+                }
+                // clean ?? 
+                // memset(&msg, 0, sizeof(msg));
+        }
+        // close fd when nothing to read end exit the thread 
+        //close(fd);
+        l_info("Exit Reading thread");
+        return EXIT_SUCCESS ; 
+}
 
 
 static int sspi_init(struct mptcpd_pm *pm)

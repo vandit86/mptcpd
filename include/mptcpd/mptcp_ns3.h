@@ -31,7 +31,7 @@ enum sspi_commands{
     SSPI_CMD_UNDEFINED=0,   //    
 
     SSPI_CMD_TCPDUMP,       // 01 (ns-3)capture traffic during simulation    
-    SSPI_CMD_DEL,           // (NOT) delete one path (endpoint id in value)
+    SSPI_CMD_CREATE_SF,     // 02 (manual) create new sf with the last added sf entry 
     SSPI_CMD_BACKUP_ON,     // 03 (manual) BKP FLAG ON all subflows with l_id        
     SSPI_CMD_BACKUP_OFF,    // 04 (manual) BKP FLAG OFF all subflows with l_id (val)   
     SSPI_CMD_STOP_RV_MSG,   // 05 (mptcpd) stop receiving tread on mptcpd (used by main)
@@ -67,7 +67,7 @@ struct sspi_data_message
 }; 
 
 
-// ::memcpy to serialize // https://stackoverflow.com/questions/16543519/serialization-of-struct
+// ::memcpy to serialize 
 
 /*  MESSAGE TYPES*/
 
