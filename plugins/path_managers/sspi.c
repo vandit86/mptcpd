@@ -14,27 +14,18 @@
 #include <assert.h>
 #include <stddef.h>  // For NULL.
 #include <limits.h>
-
 #include <netinet/in.h>
-
 #include <ell/util.h>  // For L_STRINGIFY needed by l_error().
 #include <ell/log.h>
 #include <ell/queue.h>
-
 #include <mptcpd/network_monitor.h>
 #include <mptcpd/path_manager.h>
-
-// #include <mptcpd/private/path_manager.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-//#include <conio.h>
-
 #include <mptcpd/addr_info.h>
-//#include <sockaddr.h>
 #include <mptcpd/plugin.h>
-
-// requered for pipe fifo
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -43,7 +34,6 @@
 #include <unistd.h>
 #include <stdlib.h>  // exit()
 #include <sys/wait.h>
-
 #include "mptcpd/mptcp_ns3.h"
 #include "mptcpd/private/addr_info.h"
 #include <mptcpd/private/sockaddr.h>
@@ -84,6 +74,16 @@ struct sspi_subflow_info {
         //time_t last_active time(0)    // last time active flag changed 
 }; 
 
+// save score value for each network for the specific service 
+struct sspi_service {
+        double score_wlan; 
+        double score_lte; 
+}; 
+
+// save all services scores 
+struct sspi_service_list {
+      struct sspi_service services[SSPI_SERVICE_LAST];  
+}; 
 
 /*****
  * List of @c sspi_subflow_info objects that contain MPTCP subflows of each
@@ -95,8 +95,6 @@ static struct l_queue *sspi_subflows;
  * @brief List of @c mptcpd_addr_info data saved when plugin init
  */
 static struct l_queue *sspi_interfaces;
-
-static double sspi_rss_value = -100; // dBm 
 
 /*
 *******************************************************************
@@ -170,6 +168,117 @@ sspi_sock_addr_print(struct sockaddr const *addr)
                 addr->sa_data[4],
                 addr->sa_data[5]);
         l_info ("%s",s); 
+}
+
+/********************************************************************/
+/*               FAHP decision process                           */
+/********************************************************************/
+
+
+/*
+        utility functions benefit / cost
+*/
+static double sspi_ahp_bilateral_ben (double val, double a, double b){
+        double e =  2.718281828459045; 
+        double p = -1*a * (val-b); 
+        return 1 / (1 + pow(e,p)); 
+}
+static double sspi_ahp_bilateral_cost (double val, double a, double b){
+        return 1 - sspi_ahp_bilateral_ben (val, a, b); 
+}
+static double sspi_ahp_unilateral_ben (double val, double g){
+        assert(val); 
+        return 1 - (g/val); 
+}
+static double sspi_ahp_unilateral_cost (double val, double g){
+        return 1 - (g*val); 
+}
+
+/*
+        calculate score by multiplying weigths vector and attributes 
+*/
+static double sspi_ahp_get_score (const double a[], const double w[], size_t size){
+        double res = 0.0;
+        for (size_t i=0; i < size; i++){
+                res+= a[i]*w[i]; 
+        }
+        if (res < 0.0) res = 0.0;  
+        return res; 
+}
+
+/*
+        Functions to calculate score for each service
+*/
+
+static double sspi_ahp_service_max (double attr[], size_t size){
+         // normalized weigths for max thput services  
+        const double norm[] = 
+                {0.29, 0.104, 0.027, 0.401, 0.079, 0.1}; 
+        
+        attr[0] = sspi_ahp_bilateral_ben(attr[0], 0.15, -80);   // rss   [-100 : -30 dBm]
+        attr[1] = sspi_ahp_bilateral_cost(attr[1], 0.03, 250);  // delay [ 100: 400 ms]
+        attr[2] = sspi_ahp_bilateral_cost(attr[2], 0.07, 60);   // jitter  [10 : 150 ms]
+        attr[3] = sspi_ahp_unilateral_cost(attr[3], 1.0/15);      // plr [ <15 %]
+        attr[4] = sspi_ahp_unilateral_cost(attr[4], 1.0/SSPI_LINK_COST_MAX);  
+        attr[5] = sspi_ahp_unilateral_ben(attr[5], 5);          // dweel  [> 5 s]
+
+        return sspi_ahp_get_score(attr, norm, size); 
+}
+
+/**
+ * @brief FAHP decision procedure.. calculate and save final scores for 
+ * each service for each network interface. 
+ * Attributes to concider :  RSSI, Latency, Jitter, PLR, Cost, Dwell Time
+ * @param msg msg from ns-3 
+ * @return 
+ */
+
+static void sspi_ahp_decision (const struct sspi_data_message *msg, struct sspi_service_list* list) {
+        
+        double wlan_m [] = {0, 0, 0, 0, 0, 0}; 
+        double lte_m []  = {0, 0, 0, 0, 0, 0};
+
+        wlan_m[0] = msg->phy_wlan.signal;       // [dBm]
+        wlan_m[1] = msg->flow_wlan.delay;       // ms
+        wlan_m[2] = msg->flow_wlan.jitter;      // ms
+        wlan_m[3] = msg->flow_wlan.plr;         // %
+        wlan_m[4] = msg->phy_wlan.cost;         // int 
+        wlan_m[5] = msg->phy_wlan.dweel_time;   // [s]
+
+        lte_m[0] = msg->phy_lte.signal;  
+        lte_m[1] = msg->flow_lte.delay;  
+        lte_m[2] = msg->flow_lte.jitter;  
+        lte_m[3] = msg->flow_lte.plr;  
+        lte_m[4] = msg->phy_lte.cost;  
+        lte_m[5] = msg->phy_lte.dweel_time; 
+
+        size_t w_size = sizeof (wlan_m)/sizeof(wlan_m[0]);  
+
+        // calculate score for each network for each service 
+        for (int service = 0; service < SSPI_SERVICE_LAST; service ++) {
+                double score_wlan = 0.0;
+                double score_lte = 0.0;
+                list->services[service].score_wlan = 0.0;
+                list->services[service].score_lte = 0.0;
+
+                switch (service) {
+                case SSPI_SERVICE_MAX:
+                        if (msg->phy_wlan.is_connected) {
+                                score_wlan = sspi_ahp_service_max(wlan_m, w_size);
+                        }
+                        if (msg->phy_lte.is_connected) {
+                                score_lte = sspi_ahp_service_max(lte_m, w_size);
+                        }
+                        break;
+                // case SSPI_OTHER_SERVICE 
+                default:
+                        break;
+                }
+                
+                list->services[service].score_wlan = score_wlan;
+                list->services[service].score_lte  = score_lte;
+        }
+        
 }
 
 
@@ -438,7 +547,7 @@ static bool sspi_interface_id_match(void const *a, void const *b)
 /*************************************************************************************/
 
 /**
- * @brief parsing incoming msg from ns-3 
+ * @brief parsing incoming COMMAND message  
  * 
  * @param msg message to be parsed 
  * @param in pointer to struct mptcpd_pm *const, need cast from void
@@ -563,14 +672,13 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
         else if (msg->cmd == SSPI_CMD_IPERF_START) {
             if (fork() == 0) {
                 char buf[64];
-                // maybe should try with execl () instead of system
-				sprintf(buf,"iperf -c 13.0.0.2 -e -i1 -t %d ", msg->cmd_value); 
+		sprintf(buf,"iperf -c 13.0.0.2 -e -i1 -t %d > out.txt ", msg->cmd_value); 
                 l_info("%s", buf);
-				execl ("/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh", 
+		execl ("/home/vad/mptcp-tools/use_mptcp/use_mptcp.sh", 
 						"use_mptcp.sh", 
-						buf, (char *)0);
+						buf,   (char *)0);
                 }
-
+                
         } else {
                 // just inform user, continue to reading 
                 l_info("Uknown CMD msg : %d", msg->cmd);
@@ -583,7 +691,8 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
 /*****************************************************************************************/ 
 
 /**
- * @brief receive and parse data from NS-3.
+ * @brief receive and parse data from NS-3. Calculate network score and 
+ * make PM decisions based on received attributes 
  * 
  * @param msg data from ns-3, i.e., rssi, speed, ..
  * @param in mptcpd_pm 
@@ -593,25 +702,47 @@ static int
 sspi_msg_data_parse (struct sspi_data_message* msg, void* in ){
         
         struct mptcpd_pm *const pm = (struct mptcpd_pm *)in;
-        //l_info("Received RSSI: %f, NOISE: %f ", msg->rss, msg->noise); 
+        
+        // l_info("Received WLAN data-> signal: %f, rsu_connected: %i, dweel time: %f", 
+        //                     msg->phy_wlan.signal, msg->phy_wlan.is_connected, msg->phy_wlan.dweel_time);
+        // l_info("Received LTE data-> signal: %f, rsu_connected: %i, dweel time: %f", 
+        //                     msg->phy_wlan.signal, msg->phy_wlan.is_connected, msg->phy_wlan.dweel_time);
+        // l_info("Received LTE data-> speed: %f, acc: %f, angle: %f, pos_lat: %f, pos_lon: %f, timestamp: %li", 
+        //             msg->veh_speed, msg->veh_accel, msg->veh_angle, msg->veh_pos_lat, msg->veh_pos_lon, msg->timestamp);                       
+
 
         // No active connections, nothing to manage
         if (l_queue_isempty(sspi_subflows)){
             return EXIT_SUCCESS;
         }
+        
+        /// 1. get required network/mobility metrics from msg: and 
+        // calculate AHP value for each network by * with normalized vector
+        
+        struct sspi_service_list list; 
+        sspi_ahp_decision (msg, &list); 
 
+        for (size_t service = 0; service < SSPI_SERVICE_LAST;  service++)
+        {
+                l_info ("service %lu score wlan: %f", service, list.services[service].score_wlan); 
+                l_info ("service %lu score lte: %f", service, list.services[service].score_lte); 
+        }
+ 
+        /// 3. for each type of service manage respective subflows   
+        double sspi_rss_value = msg->phy_wlan.signal;
 
         mptcpd_aid_t l_id = (uint8_t) SSPI_IFACE_WLAN; 
+        
         // find first sf with id = wlan
         struct sspi_subflow_info *info =
                 l_queue_find(sspi_subflows, sspi_subflow_id_match, &l_id);
         
         // decision about backup flag 
-        // SIMPLE LPF  α * x[i] + (1-α) * y[i-1]
-        double alpha = 0.85; // alpha value
-        sspi_rss_value = alpha * msg->rss + (1 - alpha) * sspi_rss_value;
         bool backup_wlan = (sspi_rss_value <= SSPI_RSS_THRESHOLD)? true:false;
 
+        /**
+         * need to evaluate quality of the network for each service 
+        */
         // no info avilable for sf wlan connections,receive ADD_ADDR from pear?
         if (info == NULL) {
             l_info ("no info avilable for sf wlan connections (not receive ADD_ADDR from pear ?)");
@@ -887,8 +1018,7 @@ static struct mptcpd_plugin_ops const pm_ops = {
 /*****************************************************************************************/ 
 
 /**
- * @brief starts listeng thread. Listeng for upcoming commands from NS-3
- *  
+ * @brief starts listeng thread. Listeng for upcoming Commands or data from NS-3
  * @param in mptcpd_pm path manager  
  */
 
@@ -916,9 +1046,6 @@ static void* sspi_connect_pipe(void *in)
         {
                 /* now parsing msg data                 */
                 /* read until receive stop command      */
-                // l_info("Received: %lu bytes \n", nb);
-                // l_info("msg type : %d", msg.type);
-
                 if (msg.type == SSPI_MSG_TYPE_CMD) {
                         if (sspi_msg_cmd_parse(
                                 (struct sspi_cmd_message*) (&msg.data), in) < 0)
@@ -937,7 +1064,7 @@ static void* sspi_connect_pipe(void *in)
         return EXIT_SUCCESS ; 
 }
 
-
+// called on plugin start 
 static int sspi_init(struct mptcpd_pm *pm)
 {
         /*
@@ -988,11 +1115,11 @@ static int sspi_init(struct mptcpd_pm *pm)
         return 0;
 }
 
+// called on plugin end 
 static void sspi_exit(struct mptcpd_pm *pm)
 {
         l_info ("EXIT"); 
         (void) pm;
-
         // destroy dynamic lists  
         l_queue_destroy(sspi_interfaces, sspi_interface_info_destroy);
         l_queue_destroy(sspi_subflows, sspi_subflows_destroy); 

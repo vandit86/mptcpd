@@ -14,7 +14,11 @@
 #define     SSPI_MSG_TYPE_CMD       0x01   // command 
 #define     SSPI_MSG_TYPE_DATA      0x02   // data from ns-3 
 
-#define     SSPI_RSS_THRESHOLD      -80    // -80dBm  
+#define     SSPI_RSU_RADIUS         85     // RSU covarage area [m] 
+#define     SSPI_RSS_THRESHOLD      -79    // dBm 
+#define     SSPI_LINK_LOST_MS       1000   // check link lost time     
+#define     SSPI_LINK_COST_MAX      50     // maximum cost of link usage     
+
 
 /*  COMMANDS TYPES  */
 /*  usage example : 
@@ -31,7 +35,7 @@ enum sspi_commands{
     SSPI_CMD_UNDEFINED=0,   //    
 
     SSPI_CMD_TCPDUMP,       // 01 (ns-3)capture traffic during simulation    
-    SSPI_CMD_CREATE_SF,     // 02 (manual) create new sf with the last added sf entry 
+    SSPI_CMD_CREATE_SF,     // 02 (manual) create new sf with the last added sf entry: echo -en "\01\02\00\00\00\00\c" > /tmp/mptcp-ns3-fifo 
     SSPI_CMD_BACKUP_ON,     // 03 (manual) BKP FLAG ON all subflows with l_id        
     SSPI_CMD_BACKUP_OFF,    // 04 (manual) BKP FLAG OFF all subflows with l_id (val)   
     SSPI_CMD_STOP_RV_MSG,   // 05 (mptcpd) stop receiving tread on mptcpd (used by main)
@@ -39,6 +43,12 @@ enum sspi_commands{
     
     SSPI_CMD_LAST           // last command value 
 
+};
+
+// different services types 
+enum sspi_services{
+        SSPI_SERVICE_MAX = 0,   // service garantee max throughput
+        SSPI_SERVICE_LAST
 }; 
 
 /*  MESSAGE STRUCT  */
@@ -48,8 +58,8 @@ enum sspi_commands{
  */
 struct sspi_message
 {
-    unsigned char type;           // Msg type (CMD | DATA)
-    char data [255];  
+    unsigned char type;             // Msg type (CMD | DATA)
+    char data [255];                // chould be >= data_message size 
 };
 
 // commands messages  
@@ -59,11 +69,65 @@ struct sspi_cmd_message
     int cmd_value;                  // command value (if any)
 };
 
-// data from ns-3 
+
+/**
+ * @brief struct to represent phy characteristics of the channel 
+ * https://gsm-repiteri.ru/chto-takoe-rssi-sinr-rsrp-rsrq-parametry-kachestva-signala   
+ * 
+ * @param signal RSS(wlan) or RSRP (lte)
+ * @param noise 
+ * @param pos_lat position of RSU (wlan) or eNb (lte)
+ * @param is_connected is vehicle in coverage area of Network 
+ */
+struct sspi_phy_data
+{
+        double signal;      // signal   [dBm]
+        double noise;       // noise    [dBm]
+        double pos_lat;     // 
+        double pos_lon;     // 
+        bool is_connected;  // [bool]   is connected to network
+        double dweel_time;  // [s] estimated dwelling time (High value for LTE)
+        double cost;        // cost value (max 50)
+};
+
+/**
+ * @brief struct contain ego vehicle kinematic data 
+ */
+struct sspi_veh_data
+{
+        double speed;       // [m/s]
+        double accel;       // [m^2/s]
+        double pos_lat;     // [latitude]
+        double pos_lon;     // [longitude]
+        double angle;       // [º] see SUMO angle
+}; 
+
+/**
+ * @brief struct contain per-flow connection information. 
+ * Other flow metrics also could be used..
+ * don't concider flow as valid if duration < 0 
+ */
+struct sspi_flow_data
+{
+        double rate;        // data rate    [Mbps]  
+        double delay;       // delay        [ms]
+        double jitter;      // jitter       [ms]
+        double plr;         // loss rate    [%]
+        int64_t duration;    // connection duration  [ms] ,   
+}; 
+
+/**
+ * @brief data to be sent from ns-3 envirounment, that include ego vehicle data, 
+ * channal phy characteristics and per flow metrics   
+ */
 struct sspi_data_message
 {
-    double rss;             // wlan rss value (beacon from RSU)
-    double noise;           // wlan noise 
+        struct sspi_veh_data veh;               // vehicle data 
+        struct sspi_phy_data phy_wlan;          // wlan channel  
+        struct sspi_phy_data phy_lte;           // lte channel  
+        struct sspi_flow_data flow_wlan ;       // flow on wlan path 
+        struct sspi_flow_data flow_lte ;        // flow on lte path 
+        uint64_t  timestamp_ms;                 // timestamp        [ms] 
 }; 
 
 
