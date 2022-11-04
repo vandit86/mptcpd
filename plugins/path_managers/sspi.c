@@ -38,6 +38,8 @@
 #include "mptcpd/private/addr_info.h"
 #include "mptcpd/private/sockaddr.h"
 
+// #define USE_CORE  
+
 /*
 *******************************************************************
 *      Data Struct
@@ -166,8 +168,9 @@ static bool sspi_sockaddr_match(void const *a, void const *b)
                         (struct sockaddr_in const *) lhs;
                 struct sockaddr_in const *const r =
                         (struct sockaddr_in const *) rhs;
-
-                matched = (l->sin_addr.s_addr == r->sin_addr.s_addr);
+                matched = ( (l->sin_addr.s_addr == r->sin_addr.s_addr) 
+                            //&& (l->sin_port == r->sin_port) 
+                            )    ;
         } else {
                 struct sockaddr_in6 const *const l =
                         (struct sockaddr_in6 const *) lhs;
@@ -260,8 +263,10 @@ static double sspi_ahp_service_max (double attr[], size_t size){
  * @return 
  */
 
-static void sspi_ahp_decision (const struct sspi_data_message *msg, struct sspi_service list[]) {
-        
+static void sspi_ahp_decision (const struct sspi_data_message *msg, 
+                                struct sspi_service list[]) 
+{
+        // save received metrics 
         double wlan_m [] = {0, 0, 0, 0, 0, 0}; 
         double lte_m []  = {0, 0, 0, 0, 0, 0};
 
@@ -466,14 +471,16 @@ static bool sspi_sf_match(void const *a, void const *b)
 static void sspi_sf_add( mptcpd_token_t token,
                                 struct sockaddr const *laddr,
                                 struct sockaddr const *raddr, 
-                                mptcpd_aid_t id,
+                                mptcpd_aid_t l_id,
+                                mptcpd_aid_t r_id,
                                 bool backup, 
                                 bool active)
 {
         struct sspi_subflow_info *const info =
                 l_malloc(sizeof(struct sspi_subflow_info));
 
-        info->l_id = info->r_id = id;
+        info->l_id              = l_id;
+        info->r_id              = r_id;
         info->token             = token;
         info->backup            = backup;
         info->laddr             = mptcpd_sockaddr_copy(laddr);
@@ -489,8 +496,10 @@ static void sspi_sf_add( mptcpd_token_t token,
         if (sf == NULL){
                 l_queue_push_tail(sspi_subflows, (void *) info);
         }
-        // sf found, just change 'active' status of the existing sf
-        else { 
+        // sf found, just change status information of the existing sf
+        else {
+                // sf->backup = backup; // receive bkp=1 always on new_subflow callback 
+                // l_info ("sf add l_id: %u, bkp: %u", l_id, backup); 
                 sf->active = active;
                 l_free(info);
                 // todo : check timestamp 
@@ -505,26 +514,31 @@ static void sspi_sf_add( mptcpd_token_t token,
 }
 
 
-// mange subflows usage after score is calculated. 
-// receive struct sspi_service_list with score info for each service/network 
-// @see l_queue_foreach()
+/**
+ * @brief mange subflows usage after score is calculated. 
+ * 
+ * @param data is next sf from list  @see l_queue_foreach()
+ * @param user_data struct sspi_service_list with score info for each service/network
+ */
+
 static void sspi_sf_manage (void *data, void *user_data)
 {
-    struct sspi_sf_manage_data *m_data = user_data;
-    struct sspi_subflow_info *const sf = data;
+    if (data == NULL || user_data == NULL) return; 
+    struct sspi_sf_manage_data *m_data = user_data; // list of scores & pm
+    struct sspi_subflow_info *const sf = data;      // next sf from list 
 
     // list of scores for each service/network
-    struct sspi_service const *s_list = m_data->s_list;
-    struct mptcpd_pm *const pm        = m_data->pm;
+    struct sspi_service const *s_list   = m_data->s_list;
+    struct mptcpd_pm *const pm          = m_data->pm;
 
-    const double LOW_SCORE      = 0.15;     
+    const double LOW_SCORE      = 0.25;     
     const double MEDIUM_SCORE   = 0.50;
     //const double HIGH_SCORE     = 0.85;      
     const double DELTA_SCORE    = 0.05;  // delta 5% ( TODO could vary with velocity)
 
     uint16_t const port = sspi_get_port_number(sf->raddr);
 
-       // get right ervice based on port numver 
+    // get right service based on port numver 
     enum sspi_services service;
     switch (port) {
     case 5001:                                  //max thput service:
@@ -556,7 +570,8 @@ static void sspi_sf_manage (void *data, void *user_data)
     l_info("ID: %u, token: %u, backup: %u, port:%u, active: %u, f: %2f, s :%2f ",
            sf->l_id, sf->token, sf->backup, port, sf->active, score_first, score_second);
     
-    // calculate delta score, exit if score changes is insignificant 
+    
+    // calculate DELTA score, exit if score changes is insignificant 
     double s_delta =  sf->last_score - score_first; 
     s_delta = (s_delta < 0)? s_delta * (-1.0) : s_delta;
     if (s_delta < DELTA_SCORE) return;  
@@ -565,22 +580,28 @@ static void sspi_sf_manage (void *data, void *user_data)
     if (score_first < LOW_SCORE && sf->active) {
         if (mptcpd_pm_remove_subflow( pm, sf->token, sf->laddr, sf->raddr)!= 0)
                 l_error("Can't remove subflow %u", sf->token);
-        sf->active = false;
+        l_info ("SHOULD Remove sf : %u l_id: %u, but NOT WORKS", sf->token, sf->l_id); 
+        //sf->active = false;
     }
+
     // else if sf not active : create sf and activate it
     else if (score_first >= LOW_SCORE && !sf->active) {
-            // define backup flag
+            // define backup flag based on calculated score 
             bool backup = (score_first < MEDIUM_SCORE) ? true : false;
             // will invoce new_subflow callback on sucess sf creation
             if (mptcpd_pm_add_subflow( pm, sf->token, sf->l_id, sf->r_id,
                         sf->laddr, sf->raddr, backup) != 0)
                     l_error("Can't create subflow %u", sf->token);
 
-            // TODO : should set active on callback function new_subflow..
+            l_info ("Create sf token:%u bkp:%i", sf->token, backup);  
+            // TODO : should set active on confirmed sf creation: 
+            // callback function new_subflow..
             // requires some timer/flag system to control async calls..
+            // for now assume sf is created 100%
             sf->active = true;
             sf->backup = backup; 
     }
+
     // sf is active : control sf backup status based on scores
     else if (sf->active){
             bool backup = (score_first < MEDIUM_SCORE) ? true : false;
@@ -589,10 +610,13 @@ static void sspi_sf_manage (void *data, void *user_data)
                                         sf->raddr, backup) != 0) {
                         l_error("Can't change backup status to %u", backup);
                 }
-                    // callback is not involved in this case: assume msg sent 
+                    // callback is not involved in this case: assume msg sent
+                    l_info ("Set backup l_id:%u bkp:%i", sf->l_id, backup);  
                     sf->backup = backup;
             }
-    } else {
+    } 
+    
+    else {
             // nothing to do
             return;
     }
@@ -664,8 +688,27 @@ static bool sspi_interface_id_match(void const *a, void const *b)
         return a_id == *b_id;
 }
 
+/**
+ * @brief find in list of interfaces addr_info that match addr of type sockaddr
+ *  used to find interface addr_info based on laddr in connection_established function 
+ * @param a 
+ * @param b sockaddr to find 
+ * @see l_queue_find()
+ */
+static bool sspi_interface_addr_match(void const *a, void const *b)
+{
+        assert(a);
+        assert(b);
+
+        struct mptcpd_addr_info const *const info = a;
+        struct sockaddr const *a_addr = mptcpd_addr_info_get_addr(info); 
+        struct sockaddr const *b_addr = b;
+
+        return sspi_sockaddr_match(a_addr, b_addr);
+}
 
 /*************************************************************************************/
+/**                           COMMANDs                                                */
 /*************************************************************************************/
 
 /**
@@ -787,6 +830,40 @@ sspi_msg_cmd_parse (struct sspi_cmd_message* msg, void* in){
         }
 
         /**
+         *  remove  on all subflows with l_id=2 
+         *  echo -en "\01\07\00\00\00\02\c" > /tmp/mptcp-ns3-fifo
+         * */
+        else if (msg->cmd == SSPI_CMD_REMOVE_SF) {
+                //  subflow ID to be changed
+                mptcpd_aid_t l_id = (uint8_t) msg->cmd_value;                
+                struct sspi_subflow_info *info =
+                        l_queue_find(sspi_subflows,
+                                     sspi_sf_id_match,
+                                     &l_id);
+                assert(info); 
+
+                // remove only initial first sf (id = 1), if another created 
+                if (mptcpd_pm_remove_subflow(pm,
+                                            info->token,
+                                            info->laddr,
+                                            info->raddr) !=0) {
+                        l_error ("Can't remove subflow in %u",
+                        info->token);
+
+                } else {
+                        l_info("SSPI_CMD_REMOVE_SF:%d", l_id);
+                        info->active = false;
+                }
+
+                // nothing 
+                // if (mptcpd_kpm_remove_addr(pm,id)){
+                //     l_error ("Can't REMOVE_ADDR id: %u", id); 
+                // }
+
+                 
+        }
+
+        /**
          * @brief stert generate traffic in separate process
          * echo -en "\01\06\00\00\00\05\c" > /tmp/mptcp-ns3-fifo 
          * generate mptcp traffic for 5 sec 
@@ -832,18 +909,25 @@ sspi_msg_data_parse (struct sspi_data_message* msg, void* in ){
             return EXIT_SUCCESS;
         }
         
-        // calculate the score for each service/network and save in list 
+        // 1. calculate the score for each service/network and save in list 
         struct sspi_service s_list [SSPI_SERVICE_LAST];  
         sspi_ahp_decision (msg, s_list);
 
-        struct sspi_sf_manage_data m_data = { .s_list = s_list,
-                                              .pm     = pm      };
+        // don't manage sf if using CORE emulation scenario 
+        #ifdef USE_CORE
+                (void) pm;
+                sspi_sf_manage (NULL, NULL);
+                return EXIT_SUCCESS;  
+        #endif
 
-        /// 3. for each subflow decide wich network to use, by evaluate the score 
-        l_queue_foreach (sspi_subflows, sspi_sf_manage, &m_data);
-        
-        // --------
-        
+        #ifndef USE_CORE
+                /// 2. for each subflow decide wich network to use, by
+                /// evaluate the score in FAHP procedure 
+                struct sspi_sf_manage_data m_data = { .s_list = s_list,
+                                                      .pm     = pm };
+                l_queue_foreach(sspi_subflows, sspi_sf_manage, &m_data);
+        #endif
+
         return EXIT_SUCCESS;
 } 
 
@@ -881,11 +965,29 @@ static void sspi_connection_established(mptcpd_token_t token,
                                         bool server_side, 
                                         struct mptcpd_pm *pm)
 {
-        l_info("CONNECTION ESTABLISHED: token = %u", token);
         
+        // find interface addr_info that have laddr
+        // THIS IS NOT USED 
+        struct mptcpd_addr_info *info = l_queue_find( sspi_interfaces, 
+                                            sspi_interface_addr_match, 
+                                            laddr);
+        assert(info);
+        // // get interface id from addr_info 
+        // mptcpd_aid_t l_id = mptcpd_addr_info_get_id (info);
+        // if (!l_id) l_error ("ERROR: endpoint id is 0"); 
+        
+        // TODO:: we know initial endpoint, thus we receive ADD_ADDR on other endpoin 
+        // that is left, so save this information to use it in sspi_new_address
+        // and don't use hardkoded SSPI_IFACE_WLAN vale.. where to save?
+
+        // NOW we just assume initial connection on LTE path 
+        mptcpd_aid_t l_id = SSPI_IFACE_LTE;  
+        mptcpd_aid_t r_id = SSPI_IFACE_LTE;  
+         
+        l_info("ESTABLISHED: token = %u, endp id=%u", token, l_id);
+
         // create initial 'active' , 'no backup' subflow on LTE interface
-        // TODO: get mptcp endpoint by lokking on *laddr, and interfaces list 
-        sspi_sf_add (token,laddr,raddr,SSPI_IFACE_LTE, false, true); 
+        sspi_sf_add (token,laddr,raddr,l_id, r_id, false, true); 
 
         (void) server_side;  
         (void) pm;
@@ -909,32 +1011,33 @@ static void sspi_connection_closed(mptcpd_token_t token,
 /**
  * We receive ADD_ADDR from pear : 
  * do not establish new subflow on WLAN, just save the data on subflows list.
- * new sf will be created after decision algorithm parce incoming data 
+ * new sf will be created after decision algorithm order to do it  
  */
 static void sspi_new_address(mptcpd_token_t token,
-                             mptcpd_aid_t id,
-                             struct sockaddr const *addr,
+                             mptcpd_aid_t r_id,
+                             struct sockaddr const *r_addr,
                              struct mptcpd_pm *pm)
 {
-        l_info ("NEW ADD_ADDR: token = %u , remote id = %u", token, id);
+        l_info ("NEW ADD_ADDR: token = %u , remote id = %u", token, r_id);
         
-        // find wlan interface info 
-        mptcpd_aid_t id_wlan = SSPI_IFACE_WLAN; 
-        struct mptcpd_addr_info *info = l_queue_find( sspi_interfaces, 
+        // assume WLAN iface used to create additional sf's 
+        mptcpd_aid_t l_id_wlan = SSPI_IFACE_WLAN; 
+    
+        // find local addr of wlan interface by looking of wlan id 
+        struct mptcpd_addr_info *inf = l_queue_find(sspi_interfaces, 
                                             sspi_interface_id_match, 
-                                            &id_wlan);
-        assert(info);
-        
-        // find local addr of wlan interface 
-        struct sockaddr const *l_addr = mptcpd_addr_info_get_addr(info); 
+                                            &l_id_wlan);
+        assert(inf);
+        struct sockaddr const *l_addr = mptcpd_addr_info_get_addr(inf); 
         assert(l_addr); 
+        
         // struct sockaddr *const raddr = mptcpd_sockaddr_copy(addr); 
 
         // Do not establish new subflow connection just create record about 
         // potential subflow, mark sf as 'non active', so we can use it 
         // to create new subflows when decision algorithm order it..
         // TODO: get mptcp endpoint by lokking on *laddr, and interfaces list    
-        sspi_sf_add (token, l_addr, addr, SSPI_IFACE_WLAN,false, false);
+        sspi_sf_add (token, l_addr, r_addr, l_id_wlan, r_id, false, false);
         (void) pm; 
         
         /**
@@ -972,10 +1075,16 @@ static void sspi_new_subflow(mptcpd_token_t token,
                              struct mptcpd_pm *pm)
 {
         l_info("NEW SUBFLOW: token: %u " , token);
-        
-        // create confirmed 'active' sf and add to list 
-        // TODO: get mptcp endpoint by lokking on *laddr, and interfaces list
-        sspi_sf_add (token, laddr, raddr, SSPI_IFACE_WLAN, backup, true); 
+
+        // assume addirional sf's on WLAN iface
+        mptcpd_aid_t l_id = SSPI_IFACE_WLAN;
+        mptcpd_aid_t r_id = SSPI_IFACE_WLAN;
+
+        // Update sf status to active.. 
+        // TODO: Should be another function that update active status
+        // based only on l_addr and r_addr info  
+        // because sf entry was already created on new_address callback
+        sspi_sf_add (token, laddr, raddr, l_id, r_id, backup, true); 
         (void) pm;
 }
 
@@ -1135,7 +1244,7 @@ static int sspi_init(struct mptcpd_pm *pm)
         /*
         /home/vad/mptcpd/build/src/mptcpd --plugin-dir=/home/vad/mptcpd/build/plugins/path_managers/.libs --path-manager=sspi --addr-flags=subflow
         */
-
+    
         static char const name[] = "sspi";
 
         if (!mptcpd_plugin_register_ops(name, &pm_ops)) {
@@ -1177,6 +1286,11 @@ static int sspi_init(struct mptcpd_pm *pm)
         }
         
         l_info("MPTCP single-subflow-per-interface path manager initialized.");
+        
+        #ifdef USE_CORE
+        l_info(" ! CORE IS USED !");
+        #endif
+
 
         return 0;
 }

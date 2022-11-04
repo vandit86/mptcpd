@@ -28,7 +28,6 @@
         \c     end output
 
     echo -en "\01\03\00\00\00\04\c" > /tmp/mptcp-ns3-fifo
-    echo -en "\02\01\c" > /tmp/mptcp-ns3-fifo  // set data ?? 
 */    
 enum sspi_commands{
     
@@ -40,6 +39,7 @@ enum sspi_commands{
     SSPI_CMD_BACKUP_OFF,    // 04 (manual) BKP FLAG OFF all subflows with l_id (val)   
     SSPI_CMD_STOP_RV_MSG,   // 05 (mptcpd) stop receiving tread on mptcpd (used by main)
     SSPI_CMD_IPERF_START,   // 06 (ns-3) start iperf traf gen; VAL -> time is sec
+    SSPI_CMD_REMOVE_SF,     // 07 (manual) remove sf l_id (?? nothing produce)
     
     SSPI_CMD_LAST           // last command value 
 
