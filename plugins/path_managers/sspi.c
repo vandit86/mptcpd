@@ -85,8 +85,8 @@ struct sspi_service {
 
 // data to be passed to for_each function to manage subflows
 struct sspi_sf_manage_data {
-        struct sspi_service const * s_list;   // list of scores for each service/network 
-        struct mptcpd_pm *const pm;           // path manager 
+        bool bkp;                    // set bkp flag  
+        struct mptcpd_pm *const pm;  // path manager 
 }; 
 
 /*****
@@ -200,114 +200,20 @@ sspi_sock_addr_print(struct sockaddr const *addr)
         l_info ("%s",s); 
 }
 
-/********************************************************************/
-/*               FAHP decision process                           */
-/********************************************************************/
-
-
-/*
-        utility functions benefit / cost
-*/
-static double sspi_ahp_bilateral_ben (double val, double a, double b){
-        double e =  2.718281828459045; 
-        double p = -1*a * (val-b); 
-        return 1 / (1 + pow(e,p)); 
-}
-static double sspi_ahp_bilateral_cost (double val, double a, double b){
-        return 1 - sspi_ahp_bilateral_ben (val, a, b); 
-}
-static double sspi_ahp_unilateral_ben (double val, double g){
-        assert(val); 
-        return 1 - (g/val); 
-}
-static double sspi_ahp_unilateral_cost (double val, double g){
-        return 1 - (g*val); 
-}
-
-/*
-        calculate score by multiplying weigths vector and attributes 
-*/
-static double sspi_ahp_get_score (const double a[], const double w[], size_t size){
-        double res = 0.0;
-        for (size_t i=0; i < size; i++){
-                res+= a[i]*w[i]; 
-        }
-        if (res < 0.0) res = 0.0;  
-        return res; 
-}
-
-/*
-        Functions to calculate score for each service
-*/
-
-static double sspi_ahp_service_max (double attr[], size_t size){
-         // normalized weigths for max thput services  
-        const double norm[] = 
-                {0.29, 0.104, 0.027, 0.401, 0.079, 0.1}; 
-        
-        attr[0] = sspi_ahp_bilateral_ben(attr[0], 0.15, -80);   // rss   [-100 : -30 dBm]
-        attr[1] = sspi_ahp_bilateral_cost(attr[1], 0.03, 250);  // delay [ 100: 400 ms]
-        attr[2] = sspi_ahp_bilateral_cost(attr[2], 0.07, 60);   // jitter  [10 : 150 ms]
-        attr[3] = sspi_ahp_unilateral_cost(attr[3], 1.0/15);      // plr [ <15 %]
-        attr[4] = sspi_ahp_unilateral_cost(attr[4], 1.0/SSPI_LINK_COST_MAX);  
-        attr[5] = sspi_ahp_unilateral_ben(attr[5], 5);          // dweel  [> 5 s]
-
-        return sspi_ahp_get_score(attr, norm, size); 
-}
 
 /**
- * @brief FAHP decision procedure.. calculate and save final scores for 
- * each service for each network interface. 
+ * @brief return true if wlan signal < RSS threshold  
  * Attributes to concider :  RSSI, Latency, Jitter, PLR, Cost, Dwell Time
  * @param msg msg from ns-3 
  * @return 
  */
 
-static void sspi_ahp_decision (const struct sspi_data_message *msg, 
-                                struct sspi_service list[]) 
+static bool sspi_backup_decision (const struct sspi_data_message *msg) 
 {
         // save received metrics 
-        double wlan_m [] = {0, 0, 0, 0, 0, 0}; 
-        double lte_m []  = {0, 0, 0, 0, 0, 0};
-
-        wlan_m[0] = msg->phy_wlan.signal;       // [dBm]
-        wlan_m[1] = msg->flow_wlan.delay;       // ms
-        wlan_m[2] = msg->flow_wlan.jitter;      // ms
-        wlan_m[3] = msg->flow_wlan.plr;         // %
-        wlan_m[4] = msg->phy_wlan.cost;         // int 
-        wlan_m[5] = msg->phy_wlan.dweel_time;   // [s]
-
-        lte_m[0] = msg->phy_lte.signal;  
-        lte_m[1] = msg->flow_lte.delay;  
-        lte_m[2] = msg->flow_lte.jitter;  
-        lte_m[3] = msg->flow_lte.plr;  
-        lte_m[4] = msg->phy_lte.cost;  
-        lte_m[5] = msg->phy_lte.dweel_time; 
-
-        size_t w_size = sizeof (wlan_m)/sizeof(wlan_m[0]);  
-
-        // calculate score for each network for each service 
-        for (int service = 0; service < SSPI_SERVICE_LAST; service ++) {
-
-                list[service].score_wlan = 0.0;
-                list[service].score_lte = 0.0;
-
-                switch (service) {
-                case SSPI_SERVICE_MAX:
-                        if (msg->phy_wlan.is_connected) {
-                                list[service].score_wlan = 
-                                        sspi_ahp_service_max(wlan_m, w_size);
-                        }
-                        if (msg->phy_lte.is_connected) {
-                                list[service].score_lte  = 
-                                        sspi_ahp_service_max(lte_m, w_size);
-                        }
-                        break;
-                // case SSPI_OTHER_SERVICE 
-                default:
-                        break;
-                }
-        }
+        double wlan_signal; 
+        wlan_signal = msg->phy_wlan.signal;       // [dBm]
+        return ( wlan_signal < SSPI_RSS_THRESHOLD);  
         
 }
 
@@ -527,101 +433,44 @@ static void sspi_sf_manage (void *data, void *user_data)
     struct sspi_sf_manage_data *m_data = user_data; // list of scores & pm
     struct sspi_subflow_info *const sf = data;      // next sf from list 
 
+    if (sf->l_id != SSPI_IFACE_WLAN) return;    // only control wlan inetface  
+
     // list of scores for each service/network
-    struct sspi_service const *s_list   = m_data->s_list;
-    struct mptcpd_pm *const pm          = m_data->pm;
+    bool bkp                    = m_data->bkp;     // bkp flag     
+    struct mptcpd_pm *const pm  = m_data->pm;      // pm 
 
-    const double LOW_SCORE      = 0.25;     
-    const double MEDIUM_SCORE   = 0.50;
-    //const double HIGH_SCORE     = 0.85;      
-    const double DELTA_SCORE    = 0.05;  // delta 5% ( TODO could vary with velocity)
-
-    uint16_t const port = sspi_get_port_number(sf->raddr);
-
-    // get right service based on port numver 
-    enum sspi_services service;
-    switch (port) {
-    case 5001:                                  //max thput service:
-            service = SSPI_SERVICE_MAX;
-            break;
-    // other services here
-    default:
-            l_error("Uknow service %u", port);
-            return;
-    }
-    
-    // get right score value for selected service for first and second networks 
-    double score_first, score_second;
-    switch (sf->l_id)
-    {
-    case SSPI_IFACE_LTE:
-        score_first = s_list[service].score_lte;
-        score_second = s_list[service].score_wlan;
-        break;
-    case SSPI_IFACE_WLAN:
-        score_first = s_list[service].score_wlan;
-        score_second = s_list[service].score_lte;
-        break;
-    default:
-        l_error ("Undefined local id: %u", sf->l_id); 
-        return;
-    }
-         // debug 
-    l_info("ID: %u, token: %u, backup: %u, port:%u, active: %u, f: %2f, s :%2f ",
-           sf->l_id, sf->token, sf->backup, port, sf->active, score_first, score_second);
-    
-    
-    // calculate DELTA score, exit if score changes is insignificant 
-    double s_delta =  sf->last_score - score_first; 
-    s_delta = (s_delta < 0)? s_delta * (-1.0) : s_delta;
-    if (s_delta < DELTA_SCORE) return;  
-
-    // remove active sf with low score, and set as non active 
-    if (score_first < LOW_SCORE && sf->active) {
-        if (mptcpd_pm_remove_subflow( pm, sf->token, sf->laddr, sf->raddr)!= 0)
-                l_error("Can't remove subflow %u", sf->token);
-        l_info ("SHOULD Remove sf : %u l_id: %u, but NOT WORKS", sf->token, sf->l_id); 
-        //sf->active = false;
-    }
 
     // else if sf not active : create sf and activate it
-    else if (score_first >= LOW_SCORE && !sf->active) {
-            // define backup flag based on calculated score 
-            bool backup = (score_first < MEDIUM_SCORE) ? true : false;
+    if (!sf->active ) {
             // will invoce new_subflow callback on sucess sf creation
             if (mptcpd_pm_add_subflow( pm, sf->token, sf->l_id, sf->r_id,
-                        sf->laddr, sf->raddr, backup) != 0)
+                        sf->laddr, sf->raddr, bkp) != 0)
                     l_error("Can't create subflow %u", sf->token);
 
-            l_info ("Create sf token:%u bkp:%i", sf->token, backup);  
+            l_info ("Create sf token:%u bkp:%i", sf->token, bkp);  
             // TODO : should set active on confirmed sf creation: 
             // callback function new_subflow..
             // requires some timer/flag system to control async calls..
             // for now assume sf is created 100%
             sf->active = true;
-            sf->backup = backup; 
+            sf->backup = bkp;
     }
 
     // sf is active : control sf backup status based on scores
-    else if (sf->active){
-            bool backup = (score_first < MEDIUM_SCORE) ? true : false;
-            if (sf->backup != backup){
-                if (mptcpd_pm_set_backup(pm, sf->token, sf->laddr,
-                                        sf->raddr, backup) != 0) {
-                        l_error("Can't change backup status to %u", backup);
-                }
-                    // callback is not involved in this case: assume msg sent
-                    l_info ("Set backup l_id:%u bkp:%i", sf->l_id, backup);  
-                    sf->backup = backup;
-            }
-    } 
-    
     else {
-            // nothing to do
-            return;
+            if (sf->backup != bkp) {
+                    if (mptcpd_pm_set_backup(
+                                pm, sf->token, sf->laddr, sf->raddr, bkp)
+                        != 0) {
+                            l_error("Can't change backup status to %u",
+                                    bkp);
+                    }
+                    // callback is not involved in this case: assume msg
+                    // sent
+                    l_info("Set backup l_id:%u bkp:%i", sf->l_id, bkp);
+                    sf->backup = bkp;
+            }
     }
-
-    sf->last_score = score_first; 
 }
 
 
@@ -688,24 +537,7 @@ static bool sspi_interface_id_match(void const *a, void const *b)
         return a_id == *b_id;
 }
 
-/**
- * @brief find in list of interfaces addr_info that match addr of type sockaddr
- *  used to find interface addr_info based on laddr in connection_established function 
- * @param a 
- * @param b sockaddr to find 
- * @see l_queue_find()
- */
-static bool sspi_interface_addr_match(void const *a, void const *b)
-{
-        assert(a);
-        assert(b);
 
-        struct mptcpd_addr_info const *const info = a;
-        struct sockaddr const *a_addr = mptcpd_addr_info_get_addr(info); 
-        struct sockaddr const *b_addr = b;
-
-        return sspi_sockaddr_match(a_addr, b_addr);
-}
 
 /*************************************************************************************/
 /**                           COMMANDs                                                */
@@ -909,24 +741,15 @@ sspi_msg_data_parse (struct sspi_data_message* msg, void* in ){
             return EXIT_SUCCESS;
         }
         
-        // 1. calculate the score for each service/network and save in list 
-        struct sspi_service s_list [SSPI_SERVICE_LAST];  
-        sspi_ahp_decision (msg, s_list);
+        // bkp flag on WLAN interface 
+        bool bkp = sspi_backup_decision (msg);
 
-        // don't manage sf if using CORE emulation scenario 
-        #ifdef USE_CORE
-                (void) pm;
-                sspi_sf_manage (NULL, NULL);
-                return EXIT_SUCCESS;  
-        #endif
-
-        #ifndef USE_CORE
-                /// 2. for each subflow decide wich network to use, by
-                /// evaluate the score in FAHP procedure 
-                struct sspi_sf_manage_data m_data = { .s_list = s_list,
-                                                      .pm     = pm };
+        /// 2. for each subflow set or remove bkp flag if connected to RSU 
+        if (msg->phy_wlan.is_connected){
+                struct sspi_sf_manage_data m_data = { .bkp = bkp,
+                                                      .pm  = pm };
                 l_queue_foreach(sspi_subflows, sspi_sf_manage, &m_data);
-        #endif
+        }
 
         return EXIT_SUCCESS;
 } 
@@ -965,26 +788,11 @@ static void sspi_connection_established(mptcpd_token_t token,
                                         bool server_side, 
                                         struct mptcpd_pm *pm)
 {
-        
-        // find interface addr_info that have laddr
-        // THIS IS NOT USED 
-        struct mptcpd_addr_info *info = l_queue_find( sspi_interfaces, 
-                                            sspi_interface_addr_match, 
-                                            laddr);
-        assert(info);
-        // // get interface id from addr_info 
-        // mptcpd_aid_t l_id = mptcpd_addr_info_get_id (info);
-        // if (!l_id) l_error ("ERROR: endpoint id is 0"); 
-        
-        // TODO:: we know initial endpoint, thus we receive ADD_ADDR on other endpoin 
-        // that is left, so save this information to use it in sspi_new_address
-        // and don't use hardkoded SSPI_IFACE_WLAN vale.. where to save?
-
         // NOW we just assume initial connection on LTE path 
         mptcpd_aid_t l_id = SSPI_IFACE_LTE;  
         mptcpd_aid_t r_id = SSPI_IFACE_LTE;  
          
-        l_info("ESTABLISHED: token = %u, endp id=%u", token, l_id);
+        l_info("ESTABLISHED: token = %u, l_id= %u", token, l_id);
 
         // create initial 'active' , 'no backup' subflow on LTE interface
         sspi_sf_add (token,laddr,raddr,l_id, r_id, false, true); 

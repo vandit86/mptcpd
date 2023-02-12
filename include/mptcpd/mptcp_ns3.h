@@ -15,7 +15,7 @@
 #define     SSPI_MSG_TYPE_DATA      0x02   // data from ns-3 
 
 #define     SSPI_RSU_RADIUS         85     // RSU covarage area [m] 
-#define     SSPI_RSS_THRESHOLD      -79    // dBm 
+#define     SSPI_RSS_THRESHOLD      -80    // dBm 
 #define     SSPI_LINK_LOST_MS       1000   // check link lost time     
 #define     SSPI_LINK_COST_MAX      50     // maximum cost of link usage     
 
@@ -83,7 +83,7 @@ struct sspi_phy_data
 {
         double signal;      // signal   [dBm]
         double noise;       // noise    [dBm]
-        double pos_lat;     // 
+        double pos_lat;     // pos of rsu/eNb
         double pos_lon;     // 
         bool is_connected;  // [bool]   is connected to network
         double dweel_time;  // [s] estimated dwelling time (High value for LTE)
